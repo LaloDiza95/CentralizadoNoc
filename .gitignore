@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Node
+**/node_modules/
+npm-debug.log*
+yarn-*.log
+pnpm-*.log
+
+# Builds
+client/dist/
+client/.vite/
+*.zip
+
+# Env / Secrets
+.env
+.env.*
+server/.env
+server/.env.*
+client/.env
+client/.env.*
+
+# Editor
+.vscode/
+.idea/
