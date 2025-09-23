@@ -79,4 +79,3 @@ app.listen(PORT, () => {
   console.log(`[datadog-proxy] API_BASE=${API_BASE}`)
   console.log(`[datadog-proxy] APP_BASE=${APP_BASE}`)
 })
-

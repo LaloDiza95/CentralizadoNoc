@@ -1,302 +1,261 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
-function StatusPill({ state }) {
-  const map = { OK: 'ok', Warn: 'warn', Alert: 'alert', NoData: 'warn', Unknown: 'warn' }
-  const cls = map[state] || 'warn'
-  return <span className={['pill', cls].join(' ')}>{state}</span>
+/* =========================================================
+   Helpers
+   ========================================================= */
+
+// Tags que NO deben mostrarse en la vista principal (comparación en lowercase)
+const EXCLUDED_TAGS = [
+  "excludemonitor:yes",
+  "initiative:common-user-journeys",
+  "only_noc", // tu tag suele llegar como "Only_Noc"; lo normalizamos
+];
+
+// ¿tiene un tag excluido?
+function hasExcludedTag(tags = []) {
+  const low = (tags || []).map((t) => t.toLowerCase());
+  return EXCLUDED_TAGS.some((x) => low.includes(x));
 }
 
-function useDebouncedValue(value, delay = 300) {
-  const [v, setV] = useState(value)
-  useEffect(() => { const t = setTimeout(()=>setV(value), delay); return ()=>clearTimeout(t) }, [value, delay])
-  return v
+// prioridad desde tag "priority:p1..p5" (default P3)
+function priorityFromTags(tags = []) {
+  const t = (tags || []).find((x) => /^priority:p[1-5]$/i.test(x));
+  return t ? t.split(":", 2)[1].toUpperCase() : "P3";
+}
+const prioOrder = (p) => ["P1", "P2", "P3", "P4", "P5"].indexOf((p || "").toUpperCase());
+
+// “hace X tiempo” (para Triggered de sesión)
+function since(ts) {
+  if (!ts) return "—";
+  const d = Date.now() - new Date(ts).getTime();
+  const s = Math.floor(d / 1000),
+    m = Math.floor(s / 60),
+    h = Math.floor(m / 60),
+    days = Math.floor(h / 24);
+  if (days > 0) return `${days}d`;
+  if (h > 0) return `${h}h`;
+  if (m > 0) return `${m}m`;
+  return `${s}s`;
 }
 
-function useQueryState() {
-  // restaura desde URL y localStorage
-  const params = new URLSearchParams(location.search)
-  const [search, setSearch] = useState(params.get('q') ?? localStorage.getItem('q') ?? '')
-  const [tags, setTags] = useState(params.get('tags') ?? localStorage.getItem('tags') ?? '')
-  const [stateFilter, setStateFilter] = useState(params.get('state') ?? localStorage.getItem('state') ?? 'ALL')
-  const [onlyProd, setOnlyProd] = useState((params.get('prod') ?? localStorage.getItem('prod') ?? '0') === '1')
-  const [hideOK, setHideOK] = useState((params.get('hideok') ?? localStorage.getItem('hideok') ?? '0') === '1')
-  const [pageSize, setPageSize] = useState(Number(params.get('ps') ?? localStorage.getItem('ps') ?? 50))
-  const [page, setPage] = useState(Number(params.get('p') ?? 1))
-
-  // persiste en URL + localStorage
+// input con debounce sencillo (para búsqueda)
+function useDebouncedValue(value, delay = 350) {
+  const [v, setV] = useState(value);
   useEffect(() => {
-    const p = new URLSearchParams()
-    if (search) p.set('q', search)
-    if (tags) p.set('tags', tags)
-    if (stateFilter !== 'ALL') p.set('state', stateFilter)
-    if (onlyProd) p.set('prod', '1')
-    if (hideOK) p.set('hideok', '1')
-    if (pageSize !== 50) p.set('ps', String(pageSize))
-    if (page !== 1) p.set('p', String(page))
-    history.replaceState(null, '', '?' + p.toString())
-    localStorage.setItem('q', search)
-    localStorage.setItem('tags', tags)
-    localStorage.setItem('state', stateFilter)
-    localStorage.setItem('prod', onlyProd ? '1' : '0')
-    localStorage.setItem('hideok', hideOK ? '1' : '0')
-    localStorage.setItem('ps', String(pageSize))
-  }, [search, tags, stateFilter, onlyProd, hideOK, pageSize, page])
-
-  return { search, setSearch, tags, setTags, stateFilter, setStateFilter, onlyProd, setOnlyProd, hideOK, setHideOK, pageSize, setPageSize, page, setPage }
+    const id = setTimeout(() => setV(value), delay);
+    return () => clearTimeout(id);
+  }, [value, delay]);
+  return v;
 }
 
-function useMonitors(query, { autoRefresh, refreshMs }) {
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState(null)
-  const [data, setData] = useState([])
+/* =========================================================
+   Column component (circle header + table)
+   ========================================================= */
 
-  const debouncedSearch = useDebouncedValue(query.search, 300)
-  const debouncedTags = useDebouncedValue(query.tags, 300)
+function StateColumn({ state, items, alertFirstSeen }) {
+  const color = state === "Alert" ? "alert" : state === "Warn" ? "warn" : "ok";
 
-  async function fetchData(signal) {
-    setLoading(true); setError(null)
-    try {
-      const params = new URLSearchParams()
-      if (debouncedSearch) params.set('name', debouncedSearch)
-      if (debouncedTags) params.set('tags', debouncedTags)
-      const res = await fetch('/api/monitors?' + params.toString(), { signal })
-      if (!res.ok) throw new Error('Server error ' + res.status)
-      const payload = await res.json()
-      setData(payload.monitors || [])
-    } catch (e) {
-      if (e.name !== 'AbortError') setError(e.message)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  // primera carga y cuando cambian filtros
-  useEffect(() => {
-    const ctrl = new AbortController()
-    fetchData(ctrl.signal)
-    return () => ctrl.abort()
-  }, [debouncedSearch, debouncedTags])
-
-  // auto-refresh
-  useEffect(() => {
-    if (!autoRefresh) return
-    const id = setInterval(() => fetchData(), refreshMs)
-    return () => clearInterval(id)
-  }, [autoRefresh, refreshMs, debouncedSearch, debouncedTags])
-
-  return { loading, error, data, reload: fetchData }
-}
-
-export default function App() {
-  // estado de filtros y UI
-  const {
-    search, setSearch, tags, setTags,
-    stateFilter, setStateFilter,
-    onlyProd, setOnlyProd,
-    hideOK, setHideOK,
-    pageSize, setPageSize,
-    page, setPage
-  } = useQueryState()
-
-  const [autoRefresh, setAutoRefresh] = useState(true)
-  const [refreshMs, setRefreshMs] = useState(30000) // 30s
-  const searchRef = useRef(null)
-
-  const { loading, error, data } = useMonitors(
-    { search, tags: onlyProd ? [tags, 'env:production'].filter(Boolean).join(',') : tags },
-    { autoRefresh, refreshMs }
-  )
-
-  // atajo: "s" enfoca input de búsqueda
-  useEffect(() => {
-    const onKey = (e) => { if (e.key === 's' && !e.metaKey && !e.ctrlKey) { e.preventDefault(); searchRef.current?.focus() } }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [])
-
-  // ordenar por severidad
-  const severityOrder = { Alert: 0, Warn: 1, NoData: 2, Unknown: 3, OK: 4 }
-  // filtrado por estado + ocultar OK
-  const filtered = useMemo(() => {
-    let arr = data
-    if (stateFilter !== 'ALL') arr = arr.filter(m => (m.overall_state || 'Unknown') === stateFilter)
-    if (hideOK) arr = arr.filter(m => (m.overall_state || 'Unknown') !== 'OK')
-    // sort por severidad y luego nombre
-    return arr.slice().sort((a, b) => {
-      const sa = severityOrder[a.overall_state || 'Unknown'] ?? 9
-      const sb = severityOrder[b.overall_state || 'Unknown'] ?? 9
-      if (sa !== sb) return sa - sb
-      return (a.name || '').localeCompare(b.name || '')
-    })
-  }, [data, stateFilter, hideOK])
-
-  // agrupar por service:*
-  function extractService(tagsArr) {
-    const t = tagsArr || []
-    const s = t.find(x => x.startsWith('service:'))
-    return s ? s.split(':',2)[1] : 'sin-service'
-  }
-  const groups = useMemo(() => {
-    const g = new Map()
-    for (const m of filtered) {
-      const svc = extractService(m.tags)
-      if (!g.has(svc)) g.set(svc, [])
-      g.get(svc).push(m)
-    }
-    return Array.from(g.entries()).sort((a,b)=>a[0].localeCompare(b[0]))
-  }, [filtered])
-
-  // KPIs
-  const stats = useMemo(() => {
-    const total = filtered.length
-    const byState = { OK:0, Warn:0, Alert:0, NoData:0, Unknown:0 }
-    for (const m of filtered) {
-      const st = m.overall_state || 'Unknown'
-      byState[st] = (byState[st] || 0) + 1
-    }
-    return { total, byState }
-  }, [filtered])
-
-  // paginación en cliente
-  const visibleGroups = useMemo(() => {
-    // aplanar por orden de grupos conservando items
-    const flat = []
-    for (const [, items] of groups) for (const it of items) flat.push(it)
-    const slice = flat.slice(0, page * pageSize)
-    // volver a reagrupar lo visible para render
-    const g = new Map()
-    for (const m of slice) {
-      const svc = extractService(m.tags)
-      if (!g.has(svc)) g.set(svc, [])
-      g.get(svc).push(m)
-    }
-    return Array.from(g.entries())
-  }, [groups, page, pageSize])
-
-  const canLoadMore = useMemo(() => {
-    let total = 0
-    for (const [, items] of groups) total += items.length
-    return page * pageSize < total
-  }, [groups, page, pageSize])
+  const sorted = items
+    .slice()
+    .sort(
+      (a, b) =>
+        prioOrder(priorityFromTags(a.tags)) - prioOrder(priorityFromTags(b.tags)) ||
+        (a.name || "").localeCompare(b.name || "")
+    );
 
   return (
-    <div className="container">
-      <header>
-        <h1>Dashboard Centralizado Kueski · v2.0</h1>
-        <div className="hint">Front-end React + Proxy Node (keys seguras en el server)</div>
-      </header>
+    <div className="stateCard">
+      <div className="stateHeader">
+        <div className={`circle ${color}`}>
+          <div style={{ fontSize: 14, fontWeight: 700 }}>{state}</div>
+          <div style={{ fontSize: 46, lineHeight: "46px", fontWeight: 900 }}>{sorted.length}</div>
+        </div>
+      </div>
 
-      <div className="controls toolbar">
-        <input
-          ref={searchRef}
-          placeholder="Buscar por nombre… (atajo: s)"
-          value={search}
-          onChange={(e)=>{ setSearch(e.target.value); setPage(1) }}
-        />
-        <input
-          placeholder="Filtrar por tags (comma-separated)"
-          value={tags}
-          onChange={(e)=>{ setTags(e.target.value); setPage(1) }}
-        />
+      <div className="stateTable">
+        <div className="stateHead">
+          <div>PRIORITY</div>
+          <div>STATUS</div>
+          <div>MONITOR NAME</div>
+          <div>TRIGGERED</div>
+        </div>
 
-        <div className="state-chips">
-          {['ALL','OK','Warn','Alert','NoData','Unknown'].map(s => (
-            <div
-              key={s}
-              className={'chip ' + (stateFilter === s ? 'active' : '')}
-              onClick={()=>{ setStateFilter(s); setPage(1) }}
-              title={"Filtrar: " + s}
-            >
-              {s}
+        {sorted.map((m) => (
+          <div key={m.id} className="stateRow">
+            <div>{priorityFromTags(m.tags)}</div>
+            <div>
+              <span className={`pill ${(m.overall_state || "").toLowerCase()}`}>
+                {m.overall_state || "Unknown"}
+              </span>
             </div>
-          ))}
-        </div>
-
-        <label className="switch">
-          <input type="checkbox" checked={onlyProd} onChange={e=>{ setOnlyProd(e.target.checked); setPage(1) }} />
-          Solo producción (env:production)
-        </label>
-
-        <label className="switch">
-          <input type="checkbox" checked={hideOK} onChange={e=>{ setHideOK(e.target.checked); setPage(1) }} />
-          Ocultar OK
-        </label>
-
-        <select value={pageSize} onChange={e=>{ setPageSize(Number(e.target.value)); setPage(1) }}>
-          <option value={25}>25 por página</option>
-          <option value={50}>50 por página</option>
-          <option value={100}>100 por página</option>
-          <option value={200}>200 por página</option>
-        </select>
-
-        <button onClick={()=>{ setSearch(''); setTags(''); setStateFilter('ALL'); setOnlyProd(false); setHideOK(false); setPage(1) }}>Limpiar</button>
-
-        <label className="switch" title="Auto-refresh cada 30s">
-          <input type="checkbox" checked={autoRefresh} onChange={e=>setAutoRefresh(e.target.checked)} />
-          Auto-refresh 30s
-        </label>
-      </div>
-
-      <div className="grid">
-        <div className="card" style={{gridColumn:'span 4'}}>
-          <div className="stat">
-            <div className="label">Total Monitors</div>
-            <div className="kpi">{stats.total}</div>
-          </div>
-        </div>
-        <div className="card" style={{gridColumn:'span 8'}}>
-          <div style={{display:'flex', gap:12, flexWrap:'wrap'}}>
-            <div className="stat"><div className="label">OK</div><div className="kpi"> {stats.byState.OK || 0}</div></div>
-            <div className="stat"><div className="label">Warn</div><div className="kpi"> {stats.byState.Warn || 0}</div></div>
-            <div className="stat"><div className="label">Alert</div><div className="kpi"> {stats.byState.Alert || 0}</div></div>
-            <div className="stat"><div className="label">NoData</div><div className="kpi"> {stats.byState.NoData || 0}</div></div>
-            <div className="stat"><div className="label">Unknown</div><div className="kpi"> {stats.byState.Unknown || 0}</div></div>
-          </div>
-        </div>
-      </div>
-
-      <div className="card" style={{marginTop:16}}>
-        <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:10}}>
-          <div>Monitores</div>
-          {loading && <div className="help">Cargando…</div>}
-          {error && <div className="help">Error: {error}</div>}
-        </div>
-
-        {visibleGroups.map(([svc, items]) => (
-          <div key={svc} className="section">
-            <h3>service: {svc === 'sin-service' ? '(sin tag service:*)' : svc} · {items.length}</h3>
-            <div className="list">
-              {items.map(m => (
-                <div key={m.id} className="row">
-                  <div className="name">
-                    <span className={"status-dot status-" + (m.overall_state?.toLowerCase() || 'warn')}></span>
-                    {m.name}
-                    <div><small>{m.tags?.join(', ')}</small></div>
-                  </div>
-                  <div style={{textAlign:'right'}}>
-                    <StatusPill state={m.overall_state || 'Unknown'} />
-                  </div>
-                  <div style={{textAlign:'right'}}>
-                    <a href={m.overall_url || '#'} target="_blank" rel="noreferrer">Abrir en Datadog</a>
-                  </div>
-                </div>
-              ))}
+            <div>
+              <a className="link" href={m.overall_url || "#"} target="_blank" rel="noreferrer">
+                {m.name}
+              </a>
+            </div>
+            <div className="cell-muted" title={alertFirstSeen[m.id] || ""}>
+              {state === "OK" ? "—" : since(alertFirstSeen[m.id])}
             </div>
           </div>
         ))}
 
-        {!loading && visibleGroups.length === 0 && <div className="help">Sin resultados. Ajusta filtros.</div>}
-
-        {canLoadMore && (
-          <div style={{marginTop:12, display:'flex', justifyContent:'center'}}>
-            <button onClick={()=>setPage(p => p + 1)}>Cargar más</button>
-          </div>
-        )}
-      </div>
-
-      <div className="footer">
-        Usa <code>server/.env</code> para llaves y región. Cambia <code>DATADOG_APP_BASE</code> si usas EU/US3/US5/AP1.
+        {sorted.length === 0 && <div className="empty">No monitors</div>}
       </div>
     </div>
-  )
+  );
+}
+
+/* =========================================================
+   Main App
+   ========================================================= */
+
+export default function App() {
+  // datos crudos desde el backend
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+
+  // filtros sencillos
+  const [q, setQ] = useState(""); // búsqueda por nombre
+  const qDeb = useDebouncedValue(q, 350);
+
+  // Triggered “primera vez visto en sesión” para Alert/Warn
+  const [alertFirstSeen, setAlertFirstSeen] = useState({}); // { [id]: ISO }
+
+  // auto-refresh
+  const [autorefresh, setAutorefresh] = useState(true);
+  const timerRef = useRef(null);
+
+  // Fetch monitores
+  async function load() {
+    try {
+      setLoading(true);
+      setErr("");
+      const res = await fetch("/api/monitors"); // el proxy de Vite redirige a 3001
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const list = await res.json();
+      // si tu server devuelve {monitors:[...]} en lugar de array
+      const arr = Array.isArray(list) ? list : list.monitors || [];
+      setData(arr);
+    } catch (e) {
+      setErr(e.message || "Error loading monitors");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  useEffect(() => {
+    if (!autorefresh) return;
+    timerRef.current = setInterval(load, 60_000);
+    return () => clearInterval(timerRef.current);
+  }, [autorefresh]);
+
+  // búsqueda + EXCLUSIONES (antes de todo)
+  const filtered = useMemo(() => {
+    let arr = data.filter((m) => !hasExcludedTag(m.tags));
+    if (qDeb.trim()) {
+      const s = qDeb.trim().toLowerCase();
+      arr = arr.filter(
+        (m) =>
+          (m.name || "").toLowerCase().includes(s) ||
+          (m.tags || []).some((t) => t.toLowerCase().includes(s))
+      );
+    }
+    return arr;
+  }, [data, qDeb]);
+
+  // partición por estado
+  const { alerts, warns, oks } = useMemo(() => {
+    const out = { alerts: [], warns: [], oks: [] };
+    for (const m of filtered) {
+      const s = m.overall_state || "Unknown";
+      if (s === "Alert") out.alerts.push(m);
+      else if (s === "Warn") out.warns.push(m);
+      else if (s === "OK") out.oks.push(m);
+    }
+    return out;
+  }, [filtered]);
+
+  // registrar “primera vez visto en sesión” (para Alert/Warn)
+  useEffect(() => {
+    if (![...alerts, ...warns].length) return;
+    const now = new Date().toISOString();
+    setAlertFirstSeen((prev) => {
+      const copy = { ...prev };
+      for (const m of [...alerts, ...warns]) if (!copy[m.id]) copy[m.id] = now;
+      return copy;
+    });
+  }, [alerts, warns]);
+
+  // KPIs simples
+  const stats = useMemo(() => {
+    const by = { OK: 0, Warn: 0, Alert: 0, NoData: 0, Unknown: 0 };
+    for (const m of filtered) by[m.overall_state || "Unknown"] = (by[m.overall_state || "Unknown"] || 0) + 1;
+    return { total: filtered.length, byState: by };
+  }, [filtered]);
+
+  return (
+    <div className="container">
+      {/* header */}
+      <header className="sticky">
+        <h1>Dashboard Centralizado · v2.0</h1>
+        <div className="hint">Front-end React + Proxy Node (keys seguras en el server)</div>
+      </header>
+
+      {/* toolbar */}
+      <div className="card" style={{ marginTop: 12 }}>
+        <div className="toolbar">
+          <input
+            placeholder="Buscar por nombre o tag…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            style={{ minWidth: 260 }}
+          />
+          <button onClick={load} disabled={loading}>
+            {loading ? "Cargando…" : "Refrescar"}
+          </button>
+          <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <input
+              type="checkbox"
+              checked={autorefresh}
+              onChange={(e) => setAutorefresh(e.target.checked)}
+            />
+            Auto-refresh
+          </label>
+          <div style={{ marginLeft: "auto", opacity: 0.85 }}>
+            Total: <b>{stats.total}</b> · Alert: <b>{stats.byState.Alert || 0}</b> · Warn:{" "}
+            <b>{stats.byState.Warn || 0}</b> · OK: <b>{stats.byState.OK || 0}</b>
+          </div>
+        </div>
+        {err && <div className="help">Error: {err}</div>}
+      </div>
+
+      {/* tablero 3 columnas */}
+      <div className="board">
+        <StateColumn state="Alert" items={alerts} alertFirstSeen={alertFirstSeen} />
+        <StateColumn state="Warn" items={warns} alertFirstSeen={alertFirstSeen} />
+        <StateColumn state="OK" items={oks} alertFirstSeen={alertFirstSeen} />
+      </div>
+
+      {/* loading skeleton simple */}
+      {loading && (
+        <div style={{ display: "grid", gap: 10, marginTop: 12 }}>
+          {Array.from({ length: 4 }).map((_, i) => (
+            <div key={i} className="skeleton"></div>
+          ))}
+        </div>
+      )}
+
+      {/* empty state */}
+      {!loading && stats.total === 0 && (
+        <div className="card" style={{ marginTop: 12 }}>
+          <div className="empty">Sin resultados (o todos fueron excluidos por tags).</div>
+        </div>
+      )}
+    </div>
+  );
 }
